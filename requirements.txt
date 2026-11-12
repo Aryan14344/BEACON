@@ -1,0 +1,52 @@
+# ── Core ──────────────────────────────────────────────────────────────────────
+torch>=2.3.0
+torchvision>=0.18.0
+# PyTorch Geometric (install via pip after torch is set up)
+torch-geometric>=2.5.3
+torch-scatter>=2.1.2
+torch-sparse>=0.6.18
+torch-cluster>=1.6.3
+
+# ── Data & graph ──────────────────────────────────────────────────────────────
+numpy>=1.26.0
+scipy>=1.13.0
+scikit-learn>=1.5.0
+pandas>=2.2.0
+networkx>=3.3
+
+# ── DNS & networking ──────────────────────────────────────────────────────────
+dnspython>=2.6.0
+aiohttp>=3.9.0
+tldextract>=5.1.0        # Public Suffix List
+publicsuffixlist>=0.10.0
+
+# ── Feature extraction ────────────────────────────────────────────────────────
+python-whois>=0.9.5
+tqdm>=4.66.0
+regex>=2024.5.15
+
+# ── ML baselines ─────────────────────────────────────────────────────────────
+lightgbm>=4.3.0
+optuna>=3.6.0
+shap>=0.45.0
+
+# ── Experiment tracking ───────────────────────────────────────────────────────
+wandb>=0.17.0
+hydra-core>=1.3.2
+omegaconf>=2.3.0
+
+# ── Serving & API ─────────────────────────────────────────────────────────────
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.7.0
+redis>=5.0.0
+
+# ── Evaluation & visualization ────────────────────────────────────────────────
+matplotlib>=3.9.0
+seaborn>=0.13.0
+plotly>=5.22.0
+scikit-plot>=0.3.7
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest>=8.2.0
+pytest-asyncio>=0.23.0
