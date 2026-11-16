@@ -119,6 +119,12 @@ class LoopyBP:
         """
         N = graph.num_nodes
         E = graph.edge_index.shape[1]
+
+        # Edge case: If there are no edges, beliefs are simply the normalized node priors
+        if E == 0:
+            log_beliefs = graph.log_priors - log_sum_exp(graph.log_priors, dim=1)
+            return log_beliefs[:, 1].exp()
+
         src, dst = graph.edge_index  # (E,)
 
         # Messages are stored **per directed edge** in COO order.
