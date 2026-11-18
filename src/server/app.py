@@ -18,7 +18,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 from typing import Optional, List, Dict
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+# Ensure repo root is on sys.path
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 from src.pipeline.dns_resolver import resolve_domain
 from src.features.lexical import extract_url_features, FEATURE_NAMES
@@ -70,6 +73,15 @@ def load_model():
         bp_iters=4,
         damping=0.5
     ).to(DEVICE)
+
+    # Load trained checkpoint if available
+    ckpt_path = os.path.join(REPO_ROOT, "checkpoints/h3_trained.pt")
+    if os.path.exists(ckpt_path):
+        MODEL.load_state_dict(torch.load(ckpt_path, map_location=DEVICE, weights_only=True))
+        print(f"Loaded trained H3 model checkpoint from {ckpt_path}")
+    else:
+        print("Warning: Running with randomly initialized H3 weights (checkpoint not found).")
+
     MODEL.eval()
     print(f"PhishBP Inference Server ready on {DEVICE}!")
 

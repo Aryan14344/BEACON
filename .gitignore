@@ -6,7 +6,7 @@ __pycache__/
 venv/
 dist/
 build/
-
+.git_back
 # Data (never commit raw feeds)
 data/raw/
 data/processed/
