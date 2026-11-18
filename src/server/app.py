@@ -27,16 +27,7 @@ from src.pipeline.dns_resolver import resolve_domain
 from src.features.lexical import extract_url_features, FEATURE_NAMES
 from src.models.bp_layer import PhishBPHybridH3
 
-app = FastAPI(title="PhishBP Protection API", version="1.0.0")
-
-# Enable CORS for browser extensions
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+from contextlib import asynccontextmanager
 
 # Global model state
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -45,25 +36,8 @@ N_FEATURES = len(FEATURE_NAMES)
 NUM_REL = 3  # (url->domain, domain->ip, domain->ns)
 
 
-class PredictRequest(BaseModel):
-    url: str
-
-
-class PredictResponse(BaseModel):
-    url: str
-    domain: str
-    is_phishing: bool
-    phishing_score: float  # [0.0, 1.0]
-    verdict: str           # "BENIGN", "SUSPICIOUS", "PHISHING"
-    badge_color: str       # "green", "yellow", "red"
-    dns_resolved: bool
-    ips: List[str]
-    nameservers: List[str]
-    top_risk_factors: List[str]
-
-
-@app.on_event("startup")
-def load_model():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global MODEL
     # Initialize and load H3 model
     MODEL = PhishBPHybridH3(
@@ -84,6 +58,35 @@ def load_model():
 
     MODEL.eval()
     print(f"PhishBP Inference Server ready on {DEVICE}!")
+    yield
+    print("PhishBP Inference Server shutdown complete.")
+
+
+app = FastAPI(title="PhishBP Protection API", version="1.0.0", lifespan=lifespan)
+
+# Enable CORS for browser extensions
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/")
+def root():
+    return {
+        "name": "PhishBP Protection API",
+        "version": "1.0.0",
+        "status": "online",
+        "device": str(DEVICE),
+        "docs_url": "http://127.0.0.1:8000/docs",
+        "endpoints": {
+            "predict": "POST /predict",
+            "health": "GET /health"
+        }
+    }
 
 
 @app.get("/health")
