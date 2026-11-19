@@ -1,24 +1,23 @@
 """
-FastAPI Real-Time Inference & Graph Resolution Server for PhishBP.
-Powers the Chrome Extension:
-  1. Accepts URLs via POST /predict
-  2. Resolves DNS (A, NS, CNAME) dynamically
-  3. Extracts lexical and infrastructure graph features
-  4. Runs H3 Hybrid Model inference
-  5. Returns phishing probability, safety badge, and risk explanations
+PhishBP — FastAPI Real-Time Inference Server
+Powers the Chrome Extension with:
+  - Live async DNS resolution (A, NS, CNAME records)
+  - 21-dim lexical + DNS feature extraction
+  - H3 Hybrid (Learnable BP layer) inference on GPU
+  - Swagger UI at http://127.0.0.1:8000/docs
 """
 
 import sys
 import os
-import asyncio
+from contextlib import asynccontextmanager
+from typing import Optional, List
+
 import torch
-import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl
-from typing import Optional, List, Dict
+from pydantic import BaseModel
 
-# Ensure repo root is on sys.path
+# ── Path setup ────────────────────────────────────────────────────────────────
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
@@ -27,44 +26,71 @@ from src.pipeline.dns_resolver import resolve_domain
 from src.features.lexical import extract_url_features, FEATURE_NAMES
 from src.models.bp_layer import PhishBPHybridH3
 
-from contextlib import asynccontextmanager
-
-# Global model state
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-MODEL: Optional[PhishBPHybridH3] = None
+# ── Constants ─────────────────────────────────────────────────────────────────
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 N_FEATURES = len(FEATURE_NAMES)
-NUM_REL = 3  # (url->domain, domain->ip, domain->ns)
+NUM_REL = 3        # url→domain(0), domain→ip(1), domain→ns(2)
+MODEL: Optional[PhishBPHybridH3] = None
 
+
+# ── Pydantic schemas ──────────────────────────────────────────────────────────
+
+class PredictRequest(BaseModel):
+    url: str
+    model_config = {"json_schema_extra": {"example": {"url": "https://google.com"}}}
+
+
+class PredictResponse(BaseModel):
+    url: str
+    domain: str
+    is_phishing: bool
+    phishing_score: float
+    verdict: str        # "BENIGN" | "SUSPICIOUS" | "PHISHING"
+    badge_color: str    # "green" | "yellow" | "red"
+    dns_resolved: bool
+    ips: List[str]
+    nameservers: List[str]
+    top_risk_factors: List[str]
+
+
+# ── Lifespan (modern FastAPI startup / shutdown) ───────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global MODEL
-    # Initialize and load H3 model
     MODEL = PhishBPHybridH3(
         in_features=N_FEATURES,
         hidden_dim=32,
         num_relations=NUM_REL,
         bp_iters=4,
-        damping=0.5
+        damping=0.5,
     ).to(DEVICE)
 
-    # Load trained checkpoint if available
-    ckpt_path = os.path.join(REPO_ROOT, "checkpoints/h3_trained.pt")
-    if os.path.exists(ckpt_path):
-        MODEL.load_state_dict(torch.load(ckpt_path, map_location=DEVICE, weights_only=True))
-        print(f"Loaded trained H3 model checkpoint from {ckpt_path}")
+    ckpt = os.path.join(REPO_ROOT, "checkpoints", "h3_trained.pt")
+    if os.path.exists(ckpt):
+        MODEL.load_state_dict(torch.load(ckpt, map_location=DEVICE, weights_only=True))
+        print(f"Loaded checkpoint: {ckpt}")
     else:
-        print("Warning: Running with randomly initialized H3 weights (checkpoint not found).")
+        print("WARNING: No checkpoint found — running with random weights.")
 
     MODEL.eval()
-    print(f"PhishBP Inference Server ready on {DEVICE}!")
+    print(f"PhishBP server ready on {DEVICE} ✓")
     yield
-    print("PhishBP Inference Server shutdown complete.")
+    print("PhishBP server shut down.")
 
 
-app = FastAPI(title="PhishBP Protection API", version="1.0.0", lifespan=lifespan)
+# ── App ───────────────────────────────────────────────────────────────────────
 
-# Enable CORS for browser extensions
+app = FastAPI(
+    title="PhishBP Protection API",
+    version="1.0.0",
+    description=(
+        "Real-time phishing detection via Belief Propagation × Heterogeneous GNN.\n\n"
+        "POST a URL to `/predict` and receive a verdict, phishing score, and DNS telemetry."
+    ),
+    lifespan=lifespan,
+)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -74,115 +100,117 @@ app.add_middleware(
 )
 
 
-@app.get("/")
+# ── Routes ────────────────────────────────────────────────────────────────────
+
+@app.get("/", tags=["Info"])
 def root():
     return {
         "name": "PhishBP Protection API",
         "version": "1.0.0",
-        "status": "online",
         "device": str(DEVICE),
-        "docs_url": "http://127.0.0.1:8000/docs",
-        "endpoints": {
-            "predict": "POST /predict",
-            "health": "GET /health"
-        }
+        "model_loaded": MODEL is not None,
+        "docs": "http://127.0.0.1:8000/docs",
+        "usage": "POST /predict  with  {'url': 'https://example.com'}",
     }
 
 
-@app.get("/health")
-def health_check():
-    return {"status": "healthy", "device": str(DEVICE), "model_loaded": MODEL is not None}
+@app.get("/health", tags=["Info"])
+def health():
+    return {
+        "status": "healthy",
+        "device": str(DEVICE),
+        "model_loaded": MODEL is not None,
+        "features": N_FEATURES,
+    }
 
 
-@app.post("/predict", response_model=PredictResponse)
+@app.post("/predict", response_model=PredictResponse, tags=["Inference"])
 async def predict(req: PredictRequest):
+    """
+    Score a URL for phishing risk.
+
+    1. Resolves live DNS records (A, NS, CNAME).
+    2. Extracts 21-dim lexical + DNS feature vector.
+    3. Builds a local star subgraph (domain → IPs + NSes).
+    4. Runs the trained H3 model (encoder → BP message passing).
+    5. Returns a verdict, risk score, and explanation.
+    """
+    if MODEL is None:
+        raise HTTPException(status_code=503, detail="Model not loaded yet. Try again in a moment.")
+
     url = req.url.strip()
-    if not url.startswith("http://") and not url.startswith("https://"):
+    if not (url.startswith("http://") or url.startswith("https://")):
         url = "http://" + url
 
     # Extract domain
-    domain = url.replace("https://", "").replace("http://", "").split("/")[0].split(":")[0]
+    domain = url.replace("https://", "").replace("http://", "").split("/")[0].split(":")[0].split("@")[-1]
 
-    # Step 1: Live DNS lookup
-    dns_rec = await resolve_domain(domain, timeout=2.5)
+    # --- Step 1: Live DNS resolution ---
+    dns_rec = await resolve_domain(domain, timeout=3.0)
 
-    # Step 2: Feature extraction
+    # --- Step 2: Feature extraction ---
     feat_vec = extract_url_features(url, dns_record=dns_rec)
-    x = torch.from_numpy(feat_vec).unsqueeze(0).to(DEVICE)
+    x = torch.from_numpy(feat_vec).to(DEVICE)
 
-    # Step 3: Local subgraph inference via H3
-    # Build local 1-hop star graph for the query node
-    num_sub_nodes = 1 + len(dns_rec.a_records) + len(dns_rec.ns_records)
-    sub_x = torch.zeros((num_sub_nodes, N_FEATURES), device=DEVICE)
-    sub_x[0] = x[0]
+    # --- Step 3: Local star subgraph ---
+    n_ips = len(dns_rec.a_records)
+    n_ns  = len(dns_rec.ns_records)
+    num_sub = 1 + n_ips + n_ns    # query node + IP nodes + NS nodes
 
-    # Local edge topology: query -> IPs (rel 1), query -> NS (rel 2)
-    src_list, dst_list, etype_list = [], [], []
-    curr_node = 1
-    for _ in dns_rec.a_records:
-        src_list.append(0)
-        dst_list.append(curr_node)
-        etype_list.append(1)  # domain_resolves_to_ip
-        curr_node += 1
+    sub_x = torch.zeros((num_sub, N_FEATURES), device=DEVICE)
+    sub_x[0] = x                  # query node carries all features
 
-    for _ in dns_rec.ns_records:
-        src_list.append(0)
-        dst_list.append(curr_node)
-        etype_list.append(2)  # domain_uses_ns
-        curr_node += 1
+    src_l, dst_l, et_l = [], [], []
+    for i in range(n_ips):
+        src_l.append(0); dst_l.append(1 + i);        et_l.append(1)  # domain→ip
+    for i in range(n_ns):
+        src_l.append(0); dst_l.append(1 + n_ips + i); et_l.append(2) # domain→ns
 
-    if src_list:
-        sub_ei = torch.tensor([src_list, dst_list], dtype=torch.long, device=DEVICE)
-        sub_et = torch.tensor(etype_list, dtype=torch.long, device=DEVICE)
+    if src_l:
+        sub_ei = torch.tensor([src_l, dst_l], dtype=torch.long, device=DEVICE)
+        sub_et = torch.tensor(et_l,            dtype=torch.long, device=DEVICE)
     else:
         sub_ei = torch.zeros((2, 0), dtype=torch.long, device=DEVICE)
-        sub_et = torch.zeros(0, dtype=torch.long, device=DEVICE)
+        sub_et = torch.zeros(0,      dtype=torch.long, device=DEVICE)
 
+    # --- Step 4: Inference ---
     with torch.no_grad():
         log_beliefs = MODEL(sub_x, sub_ei, sub_et)
-        phish_prob = float(log_beliefs.exp()[0, 1].cpu().item())
+        phish_prob  = float(log_beliefs.exp()[0, 1].cpu())
 
-    # Formulate risk factors
-    risk_factors = []
-    if feat_vec[FEATURE_NAMES.index("is_https")] == 0.0:
-        risk_factors.append("Insecure plain HTTP connection")
-    if feat_vec[FEATURE_NAMES.index("has_ip_in_url")] == 1.0:
-        risk_factors.append("Direct IP address used as URL host")
-    if feat_vec[FEATURE_NAMES.index("brand_in_subdomain")] == 1.0:
-        risk_factors.append("Brand name detected in subdomain (Typosquatting)")
-    if feat_vec[FEATURE_NAMES.index("char_entropy")] > 3.2:
-        risk_factors.append("Unusually high domain character randomness/entropy")
-    if not dns_rec.resolved:
-        risk_factors.append("Domain failed DNS resolution or non-existent")
+    # --- Step 5: Risk factors ---
+    fi = {name: i for i, name in enumerate(FEATURE_NAMES)}
+    risks = []
+    if feat_vec[fi["is_https"]]         == 0.0: risks.append("Insecure HTTP (no TLS)")
+    if feat_vec[fi["has_ip_in_url"]]    == 1.0: risks.append("Raw IP address used as hostname")
+    if feat_vec[fi["brand_in_subdomain"]] == 1.0: risks.append("Brand keyword in subdomain (typosquatting)")
+    if feat_vec[fi["char_entropy"]]      >  3.2: risks.append("High character entropy (random-looking domain)")
+    if feat_vec[fi["n_hyphens"]]         >  2.0: risks.append("Excessive hyphens in domain")
+    if feat_vec[fi["digit_ratio"]]       > 0.35: risks.append("High digit ratio in domain name")
+    if not dns_rec.resolved:                      risks.append("Domain failed DNS resolution (NXDOMAIN)")
 
-    # Determine verdict and badge
+    # --- Verdict ---
     if phish_prob > 0.70 or not dns_rec.resolved:
-        verdict = "PHISHING"
-        badge_color = "red"
-        is_phishing = True
+        verdict, badge, is_phish = "PHISHING",   "red",    True
     elif phish_prob > 0.40:
-        verdict = "SUSPICIOUS"
-        badge_color = "yellow"
-        is_phishing = False
+        verdict, badge, is_phish = "SUSPICIOUS", "yellow", False
     else:
-        verdict = "BENIGN"
-        badge_color = "green"
-        is_phishing = False
+        verdict, badge, is_phish = "BENIGN",     "green",  False
 
     return PredictResponse(
         url=url,
         domain=domain,
-        is_phishing=is_phishing,
+        is_phishing=is_phish,
         phishing_score=round(phish_prob, 4),
         verdict=verdict,
-        badge_color=badge_color,
+        badge_color=badge,
         dns_resolved=dns_rec.resolved,
         ips=dns_rec.a_records[:5],
         nameservers=dns_rec.ns_records[:5],
-        top_risk_factors=risk_factors
+        top_risk_factors=risks,
     )
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8000, reload=False)
