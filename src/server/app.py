@@ -58,19 +58,31 @@ class PredictResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global MODEL
-    MODEL = PhishBPHybridH3(
-        in_features=N_FEATURES,
-        hidden_dim=32,
-        num_relations=NUM_REL,
-        bp_iters=4,
-        damping=0.5,
-    ).to(DEVICE)
-
     ckpt = os.path.join(REPO_ROOT, "checkpoints", "h3_trained.pt")
+    
     if os.path.exists(ckpt):
-        MODEL.load_state_dict(torch.load(ckpt, map_location=DEVICE, weights_only=True))
-        print(f"Loaded checkpoint: {ckpt}")
+        state_dict = torch.load(ckpt, map_location=DEVICE, weights_only=True)
+        # Dynamically infer dimensions from the saved checkpoint weights
+        h_dim = state_dict["encoder.0.weight"].shape[0]
+        n_rel = state_dict["bp_layer.log_psi"].shape[0]
+        
+        MODEL = PhishBPHybridH3(
+            in_features=N_FEATURES,
+            hidden_dim=h_dim,
+            num_relations=n_rel,
+            bp_iters=4,
+            damping=0.5,
+        ).to(DEVICE)
+        MODEL.load_state_dict(state_dict)
+        print(f"Loaded checkpoint: {ckpt} (hidden_dim={h_dim}, num_relations={n_rel})")
     else:
+        MODEL = PhishBPHybridH3(
+            in_features=N_FEATURES,
+            hidden_dim=64,
+            num_relations=NUM_REL,
+            bp_iters=4,
+            damping=0.5,
+        ).to(DEVICE)
         print("WARNING: No checkpoint found — running with random weights.")
 
     MODEL.eval()
@@ -161,10 +173,11 @@ async def predict(req: PredictRequest):
     sub_x[0] = x                  # query node carries all features
 
     src_l, dst_l, et_l = [], [], []
+    max_rel = MODEL.bp_layer.log_psi.shape[0] - 1 if MODEL is not None else 0
     for i in range(n_ips):
-        src_l.append(0); dst_l.append(1 + i);        et_l.append(1)  # domain→ip
+        src_l.append(0); dst_l.append(1 + i);        et_l.append(min(1, max_rel))  # domain→ip
     for i in range(n_ns):
-        src_l.append(0); dst_l.append(1 + n_ips + i); et_l.append(2) # domain→ns
+        src_l.append(0); dst_l.append(1 + n_ips + i); et_l.append(min(2, max_rel)) # domain→ns
 
     if src_l:
         sub_ei = torch.tensor([src_l, dst_l], dtype=torch.long, device=DEVICE)
