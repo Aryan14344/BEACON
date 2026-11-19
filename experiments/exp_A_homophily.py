@@ -463,7 +463,8 @@ def main(args: argparse.Namespace) -> None:
                         n_epochs=args.epochs,
                     )
                     for m in methods:
-                        auc = run_res.get(m, {}).get("roc_auc", float("nan"))
+                        res_obj = run_res.get(m)
+                        auc = getattr(res_obj, "roc_auc", float("nan")) if res_obj is not None else float("nan")
                         seed_results[m].append(auc)
 
                 # Aggregate

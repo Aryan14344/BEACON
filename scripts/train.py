@@ -167,8 +167,8 @@ def main():
                 test_probs = probs[test_idx]
 
                 metrics = evaluate(y_true=y_test, y_score=test_probs, method="H3_Train")
-                auc = metrics.get("roc_auc", 0.0)
-                pr_auc = metrics.get("pr_auc", 0.0)
+                auc = getattr(metrics, "roc_auc", 0.0)
+                pr_auc = getattr(metrics, "pr_auc", 0.0)
 
                 logger.info(
                     f"Epoch [{epoch:02d}/{args.epochs:02d}]  "
