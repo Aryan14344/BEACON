@@ -175,24 +175,64 @@ async def predict(req: PredictRequest):
 
     # --- Step 4: Inference ---
     with torch.no_grad():
-        log_beliefs = MODEL(sub_x, sub_ei, sub_et)
-        phish_prob  = float(log_beliefs.exp()[0, 1].cpu())
+        # 1. Feature encoder output for query URL
+        query_log_prior = F.log_softmax(MODEL.encoder(x.unsqueeze(0)), dim=-1)[0]
+        feature_phish_prob = float(query_log_prior.exp()[1].cpu())
 
-    # --- Step 5: Risk factors ---
+        # 2. Local BP graph message passing
+        # Neighbor nodes (IPs, NS) have unknown labels -> assign uninformative neutral log-prior
+        # [log(0.5), log(0.5)] so they don't artificially force the query node to benign
+        if num_sub > 1 and sub_ei.shape[1] > 0:
+            log_priors = torch.full((num_sub, 2), float(np.log(0.5)), device=DEVICE)
+            log_priors[0] = query_log_prior
+            log_beliefs = MODEL.bp_layer(log_priors, sub_ei, sub_et)
+            graph_phish_prob = float(log_beliefs.exp()[0, 1].cpu())
+        else:
+            graph_phish_prob = feature_phish_prob
+
+        # Base model phishing probability
+        phish_prob = 0.6 * graph_phish_prob + 0.4 * feature_phish_prob
+
+    # --- Step 5: Risk factors & Heuristic Calibration ---
     fi = {name: i for i, name in enumerate(FEATURE_NAMES)}
     risks = []
-    if feat_vec[fi["is_https"]]         == 0.0: risks.append("Insecure HTTP (no TLS)")
-    if feat_vec[fi["has_ip_in_url"]]    == 1.0: risks.append("Raw IP address used as hostname")
-    if feat_vec[fi["brand_in_subdomain"]] == 1.0: risks.append("Brand keyword in subdomain (typosquatting)")
-    if feat_vec[fi["char_entropy"]]      >  3.2: risks.append("High character entropy (random-looking domain)")
-    if feat_vec[fi["n_hyphens"]]         >  2.0: risks.append("Excessive hyphens in domain")
-    if feat_vec[fi["digit_ratio"]]       > 0.35: risks.append("High digit ratio in domain name")
-    if not dns_rec.resolved:                      risks.append("Domain failed DNS resolution (NXDOMAIN)")
+    heuristic_penalty = 0.0
+
+    if feat_vec[fi["is_https"]] == 0.0:
+        risks.append("Insecure HTTP connection (no TLS encryption)")
+        heuristic_penalty += 0.25
+
+    if feat_vec[fi["has_ip_in_url"]] == 1.0:
+        risks.append("Raw IP address used as hostname")
+        heuristic_penalty += 0.35
+
+    if feat_vec[fi["brand_in_subdomain"]] == 1.0:
+        risks.append("Brand keyword in subdomain (typosquatting)")
+        heuristic_penalty += 0.40
+
+    if feat_vec[fi["char_entropy"]] > 3.2:
+        risks.append("High character entropy (random-looking domain)")
+        heuristic_penalty += 0.20
+
+    if feat_vec[fi["n_hyphens"]] > 2.0:
+        risks.append("Excessive hyphens in domain name")
+        heuristic_penalty += 0.15
+
+    if feat_vec[fi["digit_ratio"]] > 0.35:
+        risks.append("High digit ratio in domain name")
+        heuristic_penalty += 0.20
+
+    if not dns_rec.resolved:
+        risks.append("Domain failed DNS resolution (NXDOMAIN / unresolvable)")
+        heuristic_penalty += 0.50
+
+    # Calibrate final risk score: model probability combined with observed security risks
+    final_score = min(1.0, max(0.0, phish_prob + heuristic_penalty))
 
     # --- Verdict ---
-    if phish_prob > 0.70 or not dns_rec.resolved:
+    if final_score >= 0.65 or not dns_rec.resolved:
         verdict, badge, is_phish = "PHISHING",   "red",    True
-    elif phish_prob > 0.40:
+    elif final_score >= 0.25 or len(risks) > 0:
         verdict, badge, is_phish = "SUSPICIOUS", "yellow", False
     else:
         verdict, badge, is_phish = "BENIGN",     "green",  False
@@ -201,7 +241,7 @@ async def predict(req: PredictRequest):
         url=url,
         domain=domain,
         is_phishing=is_phish,
-        phishing_score=round(phish_prob, 4),
+        phishing_score=round(final_score, 4),
         verdict=verdict,
         badge_color=badge,
         dns_resolved=dns_rec.resolved,
